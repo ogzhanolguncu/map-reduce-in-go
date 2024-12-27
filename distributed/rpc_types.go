@@ -13,19 +13,20 @@ type GetTaskArgs struct {
 }
 
 type GetTaskReply struct {
-	TaskID  int
-	Type    TaskType
-	Input   string
-	NReduce int // For map tasks
-	MapID   int // For reduce tasks
+	Input       string
+	TaskID      int
+	Type        TaskType
+	NReduce     int
+	MapID       int
+	JobComplete bool
 }
 
 type TaskCompleteArgs struct {
+	Results  map[string]string
 	WorkerID string
+	Error    string
 	TaskID   int
 	Success  bool
-	Error    string
-	Results  map[string]string // For reduce task results
 }
 
 type TaskCompleteReply struct{}

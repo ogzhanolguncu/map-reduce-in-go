@@ -9,8 +9,8 @@ import (
 )
 
 func TestBasicMapReduce(t *testing.T) {
-	coord := NewCoordinator(2,
-		[]string{"../pg-being_ernest copy.txt", "../pg-dorian_gray copy.txt", "../pg-frankenstein copy.txt"},
+	coord := NewCoordinator(5,
+		[]string{"../pg-being_ernest.txt", "../pg-dorian_gray.txt", "../pg-frankenstein.txt"},
 		"/tmp/mr-test")
 
 	go coord.Start("localhost:1234")

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"log"
 	"net/rpc"
 	"os"
 	"sort"
@@ -59,10 +60,12 @@ func (w *Worker) Start() error {
 
 		err := client.Call("Coordinator.GetTask", args, reply)
 		if err != nil {
-			if err.Error() == "all tasks completed" {
-				return nil // Graceful exit when work is done
-			}
 			return fmt.Errorf("failed to get task: %w", err)
+		}
+
+		if reply.JobComplete {
+			log.Printf("Worker '%s' is done", w.workerID)
+			return nil
 		}
 
 		var results map[string]string
@@ -145,6 +148,7 @@ func ihash(key string) int {
 }
 
 func (w *Worker) executeReduceTask(reduceID int, mapTasks int, results map[string]string) error {
+	log.Printf("Starting reduce task %d, mapTasks: %d", reduceID, mapTasks)
 	// Read all intermediate files for this reduce task
 	var kvs []KeyValue
 
@@ -152,6 +156,7 @@ func (w *Worker) executeReduceTask(reduceID int, mapTasks int, results map[strin
 		filename := fmt.Sprintf("mr-%d-%d", mapID, reduceID)
 		file, err := os.Open(filename)
 		if err != nil {
+			log.Printf("Error opening %s: %v", filename, err)
 			continue // Skip missing files
 		}
 
@@ -165,6 +170,7 @@ func (w *Worker) executeReduceTask(reduceID int, mapTasks int, results map[strin
 		}
 		file.Close()
 	}
+	log.Printf("Reduce %d: Found %d KV pairs", reduceID, len(kvs))
 
 	// Group KVs by key
 	grouped := make(map[string][]string)
@@ -196,5 +202,7 @@ func (w *Worker) executeReduceTask(reduceID int, mapTasks int, results map[strin
 		results[k] = result
 		fmt.Fprintf(f, "%v\t%v\n", k, result)
 	}
+
+	log.Printf("Completed reduce task %d, wrote to %s", reduceID, outputFile)
 	return nil
 }
