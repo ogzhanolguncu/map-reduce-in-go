@@ -62,15 +62,21 @@ func (t *TaskTracker) AssignTask(workerID string) (*Task, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	for _, task := range t.tasks {
+	log.Printf("Attempting to assign task. Current tasks: %+v", t.tasks)
+
+	for id, task := range t.tasks {
+		log.Printf("Examining task %d: State=%v, Type=%v", id, task.State, task.Type)
 		if task.State == TaskIdle {
 			task.State = TaskInProgress
 			task.Metadata.StartTime = time.Now()
 			task.Metadata.LastWorker = workerID
 			task.Metadata.Attempts++
+			log.Printf("Assigned task %d to worker %s", id, workerID)
 			return task, nil
 		}
 	}
+
+	log.Printf("No idle tasks found")
 	return nil, nil
 }
 
@@ -94,9 +100,11 @@ func (t *TaskTracker) MarkComplete(taskID int) error {
 
 	task, exists := t.tasks[taskID]
 	if !exists {
+		log.Printf("Task %d not found", taskID)
 		return fmt.Errorf("task %d not found", taskID)
 	}
 
+	log.Printf("Marking task %d as completed. Previous state: %v", taskID, task.State)
 	task.State = TaskCompleted
 	return nil
 }

@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"net/rpc"
+	"os"
 	"sync"
 
 	"github.com/google/uuid"
@@ -27,6 +28,11 @@ type Coordinator struct {
 }
 
 func NewCoordinator(nReduce int, files []string, interDir string) *Coordinator {
+	if interDir == "" {
+		interDir = fmt.Sprintf("/tmp/mr-%s", uuid.New().String())
+		os.MkdirAll(interDir, 0755)
+	}
+
 	c := &Coordinator{
 		inputFiles:  files,
 		interDir:    interDir,
@@ -117,6 +123,7 @@ func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 	reply.Input = task.Input
 	reply.NReduce = c.taskTracker.nReduce
 	reply.MapID = len(c.inputFiles)
+	reply.InterDir = c.interDir
 
 	return nil
 }
@@ -125,8 +132,11 @@ func (c *Coordinator) TaskComplete(args *TaskCompleteArgs, reply *TaskCompleteRe
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	log.Printf("TaskComplete called for task %d, success: %v", args.TaskID, args.Success)
+
 	if args.Success {
 		if err := c.taskTracker.MarkComplete(args.TaskID); err != nil {
+			log.Printf("Error marking task complete: %v", err)
 			return err
 		}
 		if args.Results != nil {
@@ -134,6 +144,10 @@ func (c *Coordinator) TaskComplete(args *TaskCompleteArgs, reply *TaskCompleteRe
 				c.results[k] = v
 			}
 		}
+	} else {
+		log.Printf("Task %d failed: %s", args.TaskID, args.Error)
+		// Consider task reassignment logic here
 	}
+
 	return nil
 }

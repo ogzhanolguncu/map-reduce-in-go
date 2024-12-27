@@ -19,6 +19,7 @@ type GetTaskReply struct {
 	NReduce     int
 	MapID       int
 	JobComplete bool
+	InterDir    string
 }
 
 type TaskCompleteArgs struct {

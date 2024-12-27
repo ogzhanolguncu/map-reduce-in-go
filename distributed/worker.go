@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"path/filepath"
 	"sort"
 	"time"
 
@@ -18,6 +19,7 @@ type Worker struct {
 	reducer   Reducer
 	workerID  string
 	masterURL string
+	interDir  string
 }
 
 func NewWorker(m Mapper, r Reducer) *Worker {
@@ -70,6 +72,9 @@ func (w *Worker) Start() error {
 
 		var results map[string]string
 
+		// Get interDir from coordinator
+		w.interDir = reply.InterDir
+
 		switch reply.Type {
 		case MapTask:
 			err = w.executeMapTask(reply.TaskID, reply.Input, reply.NReduce)
@@ -99,6 +104,18 @@ func (w *Worker) Start() error {
 }
 
 func (w *Worker) executeMapTask(mapID int, input string, nReduce int) error {
+	if err := os.MkdirAll(w.interDir, 0755); err != nil {
+		log.Printf("Failed to create directory: %v", err)
+		return fmt.Errorf("failed to create intermediate directory: %w", err)
+	}
+
+	// Verify directory exists
+	if _, err := os.Stat(w.interDir); os.IsNotExist(err) {
+		return fmt.Errorf("directory creation failed")
+	}
+
+	log.Printf("Directory %s successfully created", w.interDir)
+
 	// Read the input file
 	content, err := os.ReadFile(input)
 	if err != nil {
@@ -116,7 +133,7 @@ func (w *Worker) executeMapTask(mapID int, input string, nReduce int) error {
 	encoders := make([]*json.Encoder, nReduce)
 
 	for i := 0; i < nReduce; i++ {
-		filename := fmt.Sprintf("mr-%d-%d", mapID, i)
+		filename := filepath.Join(w.interDir, fmt.Sprintf("mr-%d-%d", mapID, i))
 		files[i], err = os.Create(filename)
 		if err != nil {
 			return err
@@ -153,7 +170,7 @@ func (w *Worker) executeReduceTask(reduceID int, mapTasks int, results map[strin
 	var kvs []KeyValue
 
 	for mapID := 0; mapID < mapTasks; mapID++ {
-		filename := fmt.Sprintf("mr-%d-%d", mapID, reduceID)
+		filename := filepath.Join(w.interDir, fmt.Sprintf("mr-%d-%d", mapID, reduceID))
 		file, err := os.Open(filename)
 		if err != nil {
 			log.Printf("Error opening %s: %v", filename, err)

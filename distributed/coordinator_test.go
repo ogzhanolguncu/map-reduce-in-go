@@ -9,7 +9,7 @@ import (
 )
 
 func TestBasicMapReduce(t *testing.T) {
-	coord := NewCoordinator(5,
+	coord := NewCoordinator(2,
 		[]string{"../pg-being_ernest.txt", "../pg-dorian_gray.txt", "../pg-frankenstein.txt"},
 		"/tmp/mr-test")
 
