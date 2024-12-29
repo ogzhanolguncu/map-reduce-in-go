@@ -1,6 +1,7 @@
 package distributed
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -29,7 +30,7 @@ func NewWorker(m Mapper, r Reducer) *Worker {
 	}
 }
 
-func (w *Worker) Register(masterURL string) error {
+func (w *Worker) Register(masterURL string, ctx context.Context) error {
 	w.masterURL = masterURL
 	client, err := rpc.Dial("tcp", masterURL)
 	if err != nil {
@@ -46,10 +47,11 @@ func (w *Worker) Register(masterURL string) error {
 	}
 
 	w.workerID = reply.WorkerID
-	return w.Start()
+	return w.Start(ctx)
 }
 
-func (w *Worker) Start() error {
+func (w *Worker) Start(ctx context.Context) error {
+	// Create RPC client with timeout
 	client, err := rpc.Dial("tcp", w.masterURL)
 	if err != nil {
 		return fmt.Errorf("failed to connect to coordinator: %w", err)
@@ -57,12 +59,30 @@ func (w *Worker) Start() error {
 	defer client.Close()
 
 	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("Worker %s shutting down...", w.workerID)
+			return nil
+		default:
+			// Continue with task processing
+		}
+
 		args := &GetTaskArgs{WorkerID: w.workerID}
 		reply := &GetTaskReply{}
 
-		err := client.Call("Coordinator.GetTask", args, reply)
-		if err != nil {
-			return fmt.Errorf("failed to get task: %w", err)
+		// Add timeout for RPC calls
+		callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		call := client.Go("Coordinator.GetTask", args, reply, nil)
+
+		select {
+		case <-callCtx.Done():
+			cancel()
+			return fmt.Errorf("RPC timeout")
+		case result := <-call.Done:
+			cancel()
+			if result.Error != nil {
+				return fmt.Errorf("failed to get task: %w", result.Error)
+			}
 		}
 
 		if reply.JobComplete {
@@ -71,27 +91,28 @@ func (w *Worker) Start() error {
 		}
 
 		var results map[string]string
+		var taskErr error
 
 		// Get interDir from coordinator
 		w.interDir = reply.InterDir
 
 		switch reply.Type {
 		case MapTask:
-			err = w.executeMapTask(reply.TaskID, reply.Input, reply.NReduce)
+			taskErr = w.executeMapTask(reply.TaskID, reply.Input, reply.NReduce)
 		case ReduceTask:
 			results = make(map[string]string)
-			err = w.executeReduceTask(reply.TaskID, reply.MapID, results)
+			taskErr = w.executeReduceTask(reply.TaskID, reply.MapID, results)
 		}
 
 		completeArgs := &TaskCompleteArgs{
 			WorkerID: w.workerID,
 			TaskID:   reply.TaskID,
-			Success:  err == nil,
+			Success:  taskErr == nil,
 			Results:  results,
 		}
 
-		if err != nil {
-			completeArgs.Error = err.Error()
+		if taskErr != nil {
+			completeArgs.Error = taskErr.Error()
 		}
 
 		completeReply := &TaskCompleteReply{}
@@ -99,7 +120,13 @@ func (w *Worker) Start() error {
 			return fmt.Errorf("failed to report completion: %w", err)
 		}
 
-		time.Sleep(time.Second)
+		// Add backoff between tasks
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(time.Second):
+			continue
+		}
 	}
 }
 

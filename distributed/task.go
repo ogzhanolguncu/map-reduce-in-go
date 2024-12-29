@@ -8,8 +8,10 @@ import (
 )
 
 const (
-	maxAttempts    = 3
-	defaultTimeout = 10 * time.Second
+	maxAttempts          = 3
+	defaultTimeout       = 10 * time.Second
+	replicationThreshold = 1.5 // Replicate if task takes 1.5x longer than average
+	minTaskForStats      = 3   // Need at least tasks to calculate meaningful stats
 )
 
 type TaskState int
@@ -30,8 +32,16 @@ const (
 type TaskMetadata struct {
 	StartTime     time.Time
 	FailedWorkers map[string]int
+	Replicas      map[string]*TaskReplica
 	LastWorker    string
 	Attempts      int
+	ReplicaCount  int
+}
+
+type TaskReplica struct {
+	StartTime time.Time
+	WorkerID  string
+	State     TaskState
 }
 
 type Task struct {
@@ -64,14 +74,12 @@ func (t *TaskTracker) AssignTask(workerID string) (*Task, error) {
 
 	log.Printf("Attempting to assign task. Current tasks: %+v", t.tasks)
 
-	for id, task := range t.tasks {
-		log.Printf("Examining task %d: State=%v, Type=%v", id, task.State, task.Type)
+	for _, task := range t.tasks {
 		if task.State == TaskIdle {
 			task.State = TaskInProgress
 			task.Metadata.StartTime = time.Now()
 			task.Metadata.LastWorker = workerID
 			task.Metadata.Attempts++
-			log.Printf("Assigned task %d to worker %s", id, workerID)
 			return task, nil
 		}
 	}
@@ -163,6 +171,8 @@ func (t *TaskTracker) InitMapTasks(files []string) {
 			Input: file,
 			Metadata: TaskMetadata{
 				FailedWorkers: make(map[string]int),
+				Replicas:      make(map[string]*TaskReplica),
+				ReplicaCount:  0,
 			},
 		}
 	}
@@ -224,4 +234,81 @@ func (t *TaskTracker) ReassignFailedTask(taskID int, workerID string) error {
 	}
 
 	return fmt.Errorf("task %d exceeded max attempts", taskID)
+}
+
+func (t *TaskTracker) checkForStragglers() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	var completionTimes []float64
+	log.Printf("Starting straggler detection...")
+
+	// Debug completed tasks
+	for _, task := range t.tasks {
+		if task.State == TaskCompleted {
+			duration := time.Since(task.Metadata.StartTime)
+			completionTimes = append(completionTimes, duration.Seconds())
+			log.Printf("Completed task duration: %.2f seconds", duration.Seconds())
+		}
+	}
+
+	// Debug completion times
+	log.Printf("Number of completion times: %d (need %d)", len(completionTimes), minTaskForStats)
+	if len(completionTimes) < minTaskForStats {
+		log.Printf("Not enough completed tasks for statistics")
+		return
+	}
+
+	avgTime := calculateAverage(completionTimes)
+	log.Printf("Average completion time: %.2f seconds", avgTime)
+
+	// Debug in-progress tasks
+	for _, task := range t.tasks {
+		if task.State == TaskInProgress {
+			currentDuration := time.Since(task.Metadata.StartTime).Seconds()
+			threshold := avgTime * replicationThreshold
+			log.Printf("In-progress task duration: %.2f seconds (threshold: %.2f)",
+				currentDuration, threshold)
+
+			if currentDuration > threshold && task.Metadata.ReplicaCount == 0 {
+				log.Printf("Marking task for replication")
+				t.replicateTask(task)
+			}
+		}
+	}
+}
+
+func (t *TaskTracker) replicateTask(task *Task) error {
+	if task.State == TaskCompleted || task.Metadata.ReplicaCount >= 2 {
+		return nil
+	}
+
+	if task.Metadata.Replicas == nil {
+		task.Metadata.Replicas = make(map[string]*TaskReplica)
+	}
+
+	task.Metadata.ReplicaCount++
+	return nil
+}
+
+func (t *TaskTracker) cancelReplicas(taskID int, successfulWorkerID string) {
+	task := t.tasks[taskID]
+	// Cancel all replicas except the successful one
+	for workerID, replica := range task.Metadata.Replicas {
+		if workerID != successfulWorkerID {
+			replica.State = TaskIdle
+		}
+	}
+}
+
+func calculateAverage(values []float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+
+	var sum float64
+	for _, v := range values {
+		sum += v
+	}
+	return sum / float64(len(values))
 }

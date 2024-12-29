@@ -7,6 +7,7 @@ import (
 	"net/rpc"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -18,13 +19,17 @@ type WorkerInfo struct {
 }
 
 type Coordinator struct {
+	listener    net.Listener
 	workers     map[string]*WorkerInfo
 	results     map[string]string
 	taskTracker *TaskTracker
+	shutdown    chan struct{}
 	interDir    string
 	inputFiles  []string
+	wg          sync.WaitGroup
 	nReduce     int
 	mu          sync.Mutex
+	done        bool
 }
 
 func NewCoordinator(nReduce int, files []string, interDir string) *Coordinator {
@@ -39,6 +44,7 @@ func NewCoordinator(nReduce int, files []string, interDir string) *Coordinator {
 		workers:     make(map[string]*WorkerInfo),
 		results:     make(map[string]string),
 		taskTracker: NewTaskTracker(nReduce),
+		shutdown:    make(chan struct{}),
 	}
 
 	c.taskTracker.InitMapTasks(files)
@@ -52,17 +58,67 @@ func (c *Coordinator) Start(address string) error {
 	if err != nil {
 		return fmt.Errorf("failed to start RPC server: %w", err)
 	}
+	c.listener = listener
 
-	go c.taskTracker.CheckTimeouts()
-
+	// Start straggler detection
+	c.wg.Add(1)
 	go func() {
+		defer c.wg.Done()
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				if c.isJobComplete() {
+					close(c.shutdown)
+					return
+				}
+				c.taskTracker.checkForStragglers()
+			case <-c.shutdown:
+				return
+			}
+		}
+	}()
+
+	// Start timeout checker
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				c.taskTracker.CheckTimeouts()
+			case <-c.shutdown:
+				return
+			}
+		}
+	}()
+
+	// Accept connections
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
-				log.Printf("Accept error: %v", err)
+				select {
+				case <-c.shutdown:
+					return // Normal shutdown
+				default:
+					log.Printf("Accept error: %v", err)
+				}
 				continue
 			}
-			go rpc.ServeConn(conn)
+
+			c.wg.Add(1)
+			go func(conn net.Conn) {
+				defer c.wg.Done()
+				rpc.ServeConn(conn)
+			}(conn)
 		}
 	}()
 
@@ -132,11 +188,39 @@ func (c *Coordinator) TaskComplete(args *TaskCompleteArgs, reply *TaskCompleteRe
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	log.Printf("TaskComplete called for task %d, success: %v", args.TaskID, args.Success)
+	task, exists := c.taskTracker.tasks[args.TaskID]
+	if !exists {
+		return fmt.Errorf("task %d not found", args.TaskID)
+	}
 
+	// Check if this is a replica completion
+	if _, isReplica := task.Metadata.Replicas[args.WorkerID]; isReplica {
+		if args.Success {
+			// If main task isn't completed yet, mark it complete
+			if task.State != TaskCompleted {
+				task.State = TaskCompleted
+				// Store results
+				if args.Results != nil {
+					for k, v := range args.Results {
+						c.results[k] = v
+					}
+				}
+				// Cancel other replicas
+				c.taskTracker.cancelReplicas(args.TaskID, args.WorkerID)
+			}
+		} else {
+			// Handle replica failure
+			delete(task.Metadata.Replicas, args.WorkerID)
+			task.Metadata.ReplicaCount--
+			log.Printf("Replica failed for task %d by worker %s: %s",
+				args.TaskID, args.WorkerID, args.Error)
+		}
+		return nil
+	}
+
+	// Handle regular (non-replica) task completion
 	if args.Success {
 		if err := c.taskTracker.MarkComplete(args.TaskID); err != nil {
-			log.Printf("Error marking task complete: %v", err)
 			return err
 		}
 		if args.Results != nil {
@@ -146,8 +230,73 @@ func (c *Coordinator) TaskComplete(args *TaskCompleteArgs, reply *TaskCompleteRe
 		}
 	} else {
 		log.Printf("Task %d failed: %s", args.TaskID, args.Error)
-		// Consider task reassignment logic here
+		return c.taskTracker.ReassignFailedTask(args.TaskID, args.WorkerID)
 	}
 
 	return nil
+}
+
+func (c *Coordinator) Cleanup() {
+	// Signal shutdown
+	select {
+	case <-c.shutdown:
+		// Already closed
+	default:
+		close(c.shutdown)
+	}
+
+	// Close listener to stop accepting new connections
+	if c.listener != nil {
+		c.listener.Close()
+	}
+
+	// Wait for all goroutines to finish
+	c.wg.Wait()
+
+	// Clean up intermediate files
+	if err := os.RemoveAll(c.interDir); err != nil {
+		log.Printf("Error cleaning up intermediate directory: %v", err)
+	}
+}
+
+// Add method to check if coordinator has any active workers
+func (c *Coordinator) hasActiveWorkers() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for _, worker := range c.workers {
+		if worker.active {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Coordinator) isJobComplete() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.taskTracker.hasStartedReduce {
+		return false
+	}
+
+	isDone := c.taskTracker.IsReducePhaseDone()
+	if isDone && !c.done {
+		c.done = true
+		// Only log once when transitioning to done state
+		log.Println("All tasks completed, initiating shutdown...")
+	}
+
+	return isDone
+}
+
+func (c *Coordinator) IsComplete() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.taskTracker.hasStartedReduce {
+		return false
+	}
+
+	return c.taskTracker.IsReducePhaseDone()
 }

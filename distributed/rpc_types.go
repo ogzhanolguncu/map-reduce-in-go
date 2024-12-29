@@ -1,6 +1,7 @@
 package distributed
 
 type RegisterArgs struct {
+	WorkerID   string
 	WorkerAddr string
 }
 
