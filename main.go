@@ -26,17 +26,26 @@ func main() {
 	)
 	flag.Parse()
 
-	// Create context with timeout
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Setup signal handling
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
-	defer signal.Stop(sigChan)
 
 	// Create error channel
 	errChan := make(chan error, 1)
+
+	// Create context with cancel
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Handle signals in a separate goroutine
+	go func() {
+		sig := <-sigChan
+		log.Printf("Received signal: %v", sig)
+		cancel()
+		// Force exit after 5 seconds if graceful shutdown fails
+		time.AfterFunc(5*time.Second, func() {
+			log.Println("Force exiting due to timeout")
+			os.Exit(1)
+		})
+	}()
 
 	if *workerMode {
 		runWorker(ctx, cancel, sigChan, errChan, *coordinatorAddr)
@@ -44,60 +53,63 @@ func main() {
 		runCoordinator(ctx, cancel, sigChan, errChan, *nReduce, *inputFiles, *intermediateDir, *coordinatorAddr)
 	}
 
-	// Handle errors or shutdown
+	// Wait for error or shutdown
 	select {
 	case err := <-errChan:
 		if err != nil {
 			log.Printf("Error: %v", err)
 			os.Exit(1)
 		}
+		log.Println("Clean shutdown")
 	case <-ctx.Done():
-		log.Println("Shutdown complete")
+		log.Println("Context cancelled, shutdown complete")
+	case <-time.After(5 * time.Second):
+		log.Println("Shutdown timed out, forcing exit")
+		os.Exit(1)
 	}
 }
 
 func runWorker(ctx context.Context, cancel context.CancelFunc, sigChan chan os.Signal, errChan chan error, coordinatorAddr string) {
-	if coordinatorAddr == "" {
-		errChan <- fmt.Errorf("coordinator address required for worker mode")
-		return
-	}
+	log.Printf("Starting worker process...")
 
 	worker := distributed.NewWorker(
 		&map_reduce.WordCountMapper{},
 		&map_reduce.WordCountReducer{},
 	)
 
+	var wg sync.WaitGroup
+	wg.Add(1)
+
 	// Handle shutdown signal
 	go func() {
-		<-sigChan
-		log.Println("Shutting down worker...")
+		defer wg.Done()
+		select {
+		case sig := <-sigChan:
+			log.Printf("Received signal %v, shutting down...", sig)
+			cancel()
+		case <-ctx.Done():
+			log.Printf("Context done, worker shutting down...")
+		}
+	}()
+
+	// Start worker with error handling
+	go func() {
+		err := worker.Register(coordinatorAddr, ctx)
+		if err == nil ||
+			err == distributed.ErrCleanShutdown ||
+			strings.Contains(err.Error(), "RPC timeout") {
+			log.Printf("Worker completed successfully")
+			errChan <- nil
+		} else {
+			log.Printf("Worker error: %v", err)
+			errChan <- err
+		}
 		cancel()
 	}()
 
-	// Start worker with retry logic
-	go func() {
-		const maxRetries = 3
-		for retry := 0; retry < maxRetries; retry++ {
-			if retry > 0 {
-				log.Printf("Retrying connection to coordinator (attempt %d/%d)...", retry+1, maxRetries)
-				time.Sleep(time.Second * time.Duration(retry+1))
-			}
-
-			err := worker.Register(coordinatorAddr, ctx)
-			if err == nil {
-				errChan <- nil
-				return
-			}
-
-			if ctx.Err() != nil {
-				errChan <- ctx.Err()
-				return
-			}
-
-			log.Printf("Worker failed to start: %v", err)
-		}
-		errChan <- fmt.Errorf("failed to connect to coordinator after %d attempts", maxRetries)
-	}()
+	<-ctx.Done()
+	wg.Wait()
+	log.Printf("Worker shutdown complete")
 }
 
 func runCoordinator(ctx context.Context, cancel context.CancelFunc, sigChan chan os.Signal,
@@ -123,25 +135,25 @@ func runCoordinator(ctx context.Context, cancel context.CancelFunc, sigChan chan
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(1)
+	wg.Add(2) // One for signal handling, one for job completion monitoring
 
-	// Handle shutdown
+	// Handle shutdown signals
 	go func() {
 		defer wg.Done()
 		select {
 		case sig := <-sigChan:
 			log.Printf("Received signal: %v", sig)
+			coordinator.Cleanup()
+			cancel()
 		case <-ctx.Done():
 			log.Println("Context cancelled")
+			coordinator.Cleanup()
 		}
-
-		log.Println("Initiating graceful shutdown...")
-		coordinator.Cleanup()
-		cancel()
 	}()
 
-	// Monitor job completion separately
+	// Monitor job completion
 	go func() {
+		defer wg.Done()
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 

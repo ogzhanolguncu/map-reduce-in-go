@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	. "github.com/ogzhanolguncu/map-reduce-in-go/map_reduce"
@@ -33,7 +34,10 @@ func NewWorker(m Mapper, r Reducer) *Worker {
 	}
 }
 
+var ErrCleanShutdown = fmt.Errorf("clean shutdown")
+
 func (w *Worker) Register(masterURL string, ctx context.Context) error {
+	log.Printf("Attempting to register with coordinator at %s", masterURL)
 	w.masterURL = masterURL
 
 	// Create RPC client
@@ -47,13 +51,14 @@ func (w *Worker) Register(masterURL string, ctx context.Context) error {
 	args := &RegisterArgs{WorkerAddr: w.masterURL}
 	reply := &RegisterReply{}
 
+	log.Printf("Sending registration request...")
 	err = client.Call("Coordinator.Register", args, reply)
 	if err != nil {
 		return fmt.Errorf("failed to register: %w", err)
 	}
 
 	w.workerID = reply.WorkerID
-	log.Printf("Worker registered with ID: %s", w.workerID)
+	log.Printf("Successfully registered with coordinator. Assigned ID: %s", w.workerID)
 
 	// Create a new client for long-running operations
 	taskClient, err := rpc.Dial("tcp", masterURL)
@@ -62,26 +67,37 @@ func (w *Worker) Register(masterURL string, ctx context.Context) error {
 	}
 	defer taskClient.Close()
 
-	// Start heartbeat goroutine with its own client
-	errCh := make(chan error, 1)
+	// Start heartbeat and task processing
+	errCh := make(chan error, 2)
+
+	// Start heartbeat goroutine
 	go func() {
-		errCh <- w.startHeartbeat(ctx, taskClient)
+		if err := w.startHeartbeat(ctx, taskClient); err == ErrCleanShutdown {
+			errCh <- nil
+		} else {
+			errCh <- err
+		}
 	}()
 
-	// Start processing tasks using the same client
-	processingErrCh := make(chan error, 1)
+	// Start task processing
 	go func() {
-		processingErrCh <- w.processTasks(ctx, taskClient)
+		if err := w.processTasks(ctx, taskClient); err == ErrCleanShutdown {
+			errCh <- nil
+		} else {
+			errCh <- err
+		}
 	}()
 
-	// Wait for either context cancellation or an error
+	// Wait for either completion or error
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case err := <-errCh:
-		return fmt.Errorf("heartbeat error: %w", err)
-	case err := <-processingErrCh:
-		return fmt.Errorf("processing error: %w", err)
+		if err == nil {
+			log.Printf("Worker completed successfully")
+			return nil
+		}
+		return fmt.Errorf("worker error: %w", err)
 	}
 }
 
@@ -238,34 +254,25 @@ func (w *Worker) startHeartbeat(ctx context.Context, client *rpc.Client) error {
 		case <-ctx.Done():
 			log.Printf("Worker %s heartbeat stopped: context done", w.workerID)
 			return ctx.Err()
-
 		case <-ticker.C:
-			log.Printf("Worker %s sending heartbeat", w.workerID)
-
-			status := WorkerStatus{
-				CurrentTaskID: w.currentTaskID,
-				TaskProgress:  w.taskProgress,
-				LastError:     w.lastError,
-				Timestamp:     time.Now(),
-			}
-
 			args := &HeartbeatArgs{
 				WorkerID: w.workerID,
-				Status:   status,
+				Status:   w.getStatus(),
 			}
 			reply := &HeartbeatReply{}
 
-			err := client.Call("Coordinator.Heartbeat", args, reply)
-			if err != nil {
+			if err := client.Call("Coordinator.Heartbeat", args, reply); err != nil {
+				if !reply.ShouldContinue {
+					log.Printf("Worker %s gracefully disconnecting", w.workerID)
+					return ErrCleanShutdown
+				}
 				log.Printf("Worker %s heartbeat failed: %v", w.workerID, err)
 				return fmt.Errorf("heartbeat failed: %w", err)
 			}
 
-			log.Printf("Worker %s heartbeat successful", w.workerID)
-
 			if !reply.ShouldContinue {
 				log.Printf("Worker %s received shutdown signal", w.workerID)
-				return nil
+				return ErrCleanShutdown
 			}
 		}
 	}
@@ -281,10 +288,9 @@ func (w *Worker) processTasks(ctx context.Context, client *rpc.Client) error {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("Worker %s shutting down...", w.workerID)
+			log.Printf("Worker %s context cancelled, stopping task processing", w.workerID)
 			return nil
 		default:
-			// Continue with task processing
 		}
 
 		args := &GetTaskArgs{WorkerID: w.workerID}
@@ -297,16 +303,31 @@ func (w *Worker) processTasks(ctx context.Context, client *rpc.Client) error {
 		select {
 		case <-callCtx.Done():
 			cancel()
+			if ctx.Err() != nil {
+				// Context cancelled, clean exit
+				return nil
+			}
+			// If we get a timeout after job completion, exit cleanly
+			if w.taskProgress == 1.0 {
+				return nil
+			}
 			return fmt.Errorf("RPC timeout")
 		case result := <-call.Done:
 			cancel()
 			if result.Error != nil {
+				// Check for common shutdown conditions
+				if strings.Contains(result.Error.Error(), "connection refused") ||
+					strings.Contains(result.Error.Error(), "connection reset by peer") ||
+					strings.Contains(result.Error.Error(), "EOF") {
+					log.Printf("Coordinator appears to have shut down, exiting cleanly")
+					return nil
+				}
 				return fmt.Errorf("failed to get task: %w", result.Error)
 			}
 		}
 
 		if reply.JobComplete {
-			log.Printf("Worker '%s' is done", w.workerID)
+			log.Printf("Worker %s: job complete signal received", w.workerID)
 			return nil
 		}
 
@@ -347,5 +368,16 @@ func (w *Worker) processTasks(ctx context.Context, client *rpc.Client) error {
 		case <-time.After(time.Second):
 			continue
 		}
+	}
+}
+
+func (w *Worker) getStatus() WorkerStatus {
+	return WorkerStatus{
+		CurrentTaskID: w.currentTaskID,
+		TaskProgress:  w.taskProgress,
+		LastError:     w.lastError,
+		Timestamp:     time.Now(),
+		MemoryUsage:   0,
+		CPUUsage:      0,
 	}
 }

@@ -22,12 +22,36 @@ const (
 	TaskCompleted
 )
 
+func (s TaskState) String() string {
+	switch s {
+	case TaskIdle:
+		return "Idle"
+	case TaskInProgress:
+		return "InProgress"
+	case TaskCompleted:
+		return "Completed"
+	default:
+		return fmt.Sprintf("Unknown(%d)", int(s))
+	}
+}
+
 type TaskType int
 
 const (
 	MapTask TaskType = iota
 	ReduceTask
 )
+
+func (t TaskType) String() string {
+	switch t {
+	case MapTask:
+		return "Map"
+	case ReduceTask:
+		return "Reduce"
+	default:
+		return fmt.Sprintf("Unknown(%d)", int(t))
+	}
+}
 
 type TaskMetadata struct {
 	StartTime     time.Time
@@ -121,9 +145,10 @@ func (t *TaskTracker) IsMapPhaseDone() bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	log.Printf("Checking map phase completion. Tasks: %+v", t.tasks)
-	for _, task := range t.tasks {
-		log.Printf("Task %d: Type=%d, State=%d", task.ID, task.Type, task.State)
+	log.Printf("Checking map phase completion. Total tasks: %d", len(t.tasks))
+	for id, task := range t.tasks {
+		log.Printf("Task %d: Type=%s, State=%s, Input=%s",
+			id, task.Type, task.State, task.Input)
 		if task.Type == MapTask && task.State != TaskCompleted {
 			return false
 		}
@@ -136,6 +161,7 @@ func (t *TaskTracker) IsReducePhaseDone() bool {
 	defer t.mu.RUnlock()
 
 	for _, task := range t.tasks {
+		log.Printf("Task %d is not complete: %s", task.ID, task.State)
 		if task.Type == ReduceTask && task.State != TaskCompleted {
 			return false
 		}

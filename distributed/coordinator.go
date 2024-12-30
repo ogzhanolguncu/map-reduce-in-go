@@ -78,7 +78,7 @@ func (c *Coordinator) Start(address string) error {
 			select {
 			case <-ticker.C:
 				if c.isJobComplete() {
-					close(c.shutdown)
+					c.initiateShutdown()
 					return
 				}
 				c.taskTracker.checkForStragglers()
@@ -264,17 +264,8 @@ func (c *Coordinator) TaskComplete(args *TaskCompleteArgs, reply *TaskCompleteRe
 }
 
 func (c *Coordinator) Cleanup() {
-	c.mu.Lock()
-	c.isShuttingDown = true
-	c.mu.Unlock()
-
-	// Signal shutdown
-	select {
-	case <-c.shutdown:
-		// Already closed
-	default:
-		close(c.shutdown)
-	}
+	// Initiate shutdown if not already done
+	c.initiateShutdown()
 
 	// Close listener to stop accepting new connections
 	if c.listener != nil {
@@ -304,26 +295,22 @@ func (c *Coordinator) recordHeartbeat(workerID string, status WorkerStatus) {
 }
 
 func (c *Coordinator) Heartbeat(args *HeartbeatArgs, reply *HeartbeatReply) error {
-	log.Printf("Received heartbeat from worker %s", args.WorkerID)
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	if args.WorkerID == "" {
-		return fmt.Errorf("invalid worker ID")
+	if c.isShuttingDown {
+		reply.ShouldContinue = false
+		return nil
 	}
 
-	c.mu.Lock()
 	worker, exists := c.workers[args.WorkerID]
 	if !exists {
-		c.mu.Unlock()
-		log.Printf("Heartbeat from unknown worker %s", args.WorkerID)
 		return fmt.Errorf("unknown worker")
 	}
 
 	worker.lastHeartbeat = time.Now()
 	worker.status = args.Status
 	worker.active = true
-	c.mu.Unlock()
-
-	log.Printf("Updated heartbeat for worker %s", args.WorkerID)
 
 	reply.ShouldContinue = !c.isShuttingDown
 	return nil
@@ -408,12 +395,49 @@ func (c *Coordinator) isJobComplete() bool {
 		return false
 	}
 
-	isDone := c.taskTracker.IsReducePhaseDone()
-	if isDone && !c.done {
-		c.done = true
-		// Only log once when transitioning to done state
-		log.Println("All tasks completed, initiating shutdown...")
+	// Add verification of all tasks
+	allTasksCompleted := true
+	for _, task := range c.taskTracker.tasks {
+		if task.State != TaskCompleted {
+			log.Printf("Task %d still in state: %s", task.ID, task.State)
+			allTasksCompleted = false
+			break
+		}
 	}
 
-	return isDone
+	if allTasksCompleted && !c.done {
+		c.done = true
+		log.Println("All tasks completed, initiating shutdown...")
+		// Ensure clean shutdown signal is sent to workers
+		c.initiateShutdown()
+	}
+
+	return allTasksCompleted
+}
+
+func (c *Coordinator) initiateShutdown() {
+	c.mu.Lock()
+	if !c.isShuttingDown {
+		c.isShuttingDown = true
+		close(c.shutdown)
+		// Immediately close the listener to stop accepting new connections
+		if c.listener != nil {
+			c.listener.Close()
+		}
+		// Force close any existing connections
+		for _, worker := range c.workers {
+			worker.active = false
+		}
+	}
+	c.mu.Unlock()
+
+	// Give a short grace period for cleanup
+	time.Sleep(100 * time.Millisecond)
+
+	// Force exit after timeout
+	go func() {
+		time.Sleep(5 * time.Second)
+		log.Println("Forcing exit due to shutdown timeout")
+		os.Exit(0)
+	}()
 }
