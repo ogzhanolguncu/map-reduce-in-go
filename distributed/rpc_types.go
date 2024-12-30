@@ -1,5 +1,25 @@
 package distributed
 
+import "time"
+
+type HeartbeatArgs struct {
+	WorkerID string
+	Status   WorkerStatus
+}
+
+type HeartbeatReply struct {
+	ShouldContinue bool
+}
+
+type WorkerStatus struct {
+	Timestamp     time.Time
+	LastError     string
+	CurrentTaskID int
+	TaskProgress  float64
+	MemoryUsage   uint64
+	CPUUsage      float64
+}
+
 type RegisterArgs struct {
 	WorkerID   string
 	WorkerAddr string
@@ -15,12 +35,12 @@ type GetTaskArgs struct {
 
 type GetTaskReply struct {
 	Input       string
+	InterDir    string
 	TaskID      int
 	Type        TaskType
 	NReduce     int
 	MapID       int
 	JobComplete bool
-	InterDir    string
 }
 
 type TaskCompleteArgs struct {

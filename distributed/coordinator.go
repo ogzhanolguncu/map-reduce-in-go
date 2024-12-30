@@ -13,23 +13,28 @@ import (
 )
 
 type WorkerInfo struct {
-	id      string
-	address string
-	active  bool
+	lastHeartbeat time.Time
+	id            string
+	address       string
+	status        WorkerStatus
+	active        bool
 }
 
 type Coordinator struct {
-	listener    net.Listener
-	workers     map[string]*WorkerInfo
-	results     map[string]string
-	taskTracker *TaskTracker
-	shutdown    chan struct{}
-	interDir    string
-	inputFiles  []string
-	wg          sync.WaitGroup
-	nReduce     int
-	mu          sync.Mutex
-	done        bool
+	listener            net.Listener
+	workers             map[string]*WorkerInfo
+	results             map[string]string
+	taskTracker         *TaskTracker
+	shutdown            chan struct{}
+	interDir            string
+	inputFiles          []string
+	wg                  sync.WaitGroup
+	nReduce             int
+	healthCheckInterval time.Duration
+	maxHeartbeatDelay   time.Duration
+	mu                  sync.Mutex
+	done                bool
+	isShuttingDown      bool
 }
 
 func NewCoordinator(nReduce int, files []string, interDir string) *Coordinator {
@@ -39,14 +44,17 @@ func NewCoordinator(nReduce int, files []string, interDir string) *Coordinator {
 	}
 
 	c := &Coordinator{
-		inputFiles:  files,
-		interDir:    interDir,
-		workers:     make(map[string]*WorkerInfo),
-		results:     make(map[string]string),
-		taskTracker: NewTaskTracker(nReduce),
-		shutdown:    make(chan struct{}),
+		inputFiles:          files,
+		interDir:            interDir,
+		workers:             make(map[string]*WorkerInfo),
+		results:             make(map[string]string),
+		taskTracker:         NewTaskTracker(nReduce),
+		shutdown:            make(chan struct{}),
+		healthCheckInterval: 5 * time.Second,
+		maxHeartbeatDelay:   10 * time.Second,
 	}
 
+	c.startHealthCheck()
 	c.taskTracker.InitMapTasks(files)
 
 	return c
@@ -66,7 +74,6 @@ func (c *Coordinator) Start(address string) error {
 		defer c.wg.Done()
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
-
 		for {
 			select {
 			case <-ticker.C:
@@ -87,11 +94,26 @@ func (c *Coordinator) Start(address string) error {
 		defer c.wg.Done()
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
-
 		for {
 			select {
 			case <-ticker.C:
 				c.taskTracker.CheckTimeouts()
+			case <-c.shutdown:
+				return
+			}
+		}
+	}()
+
+	// Start worker health checker
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		ticker := time.NewTicker(c.healthCheckInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				c.checkWorkerHealth()
 			case <-c.shutdown:
 				return
 			}
@@ -113,7 +135,6 @@ func (c *Coordinator) Start(address string) error {
 				}
 				continue
 			}
-
 			c.wg.Add(1)
 			go func(conn net.Conn) {
 				defer c.wg.Done()
@@ -135,11 +156,17 @@ func (c *Coordinator) Register(args *RegisterArgs, reply *RegisterReply) error {
 	}
 
 	c.workers[wId.String()] = &WorkerInfo{
-		id:      wId.String(),
-		address: args.WorkerAddr,
-		active:  true,
+		id:            wId.String(),
+		address:       args.WorkerAddr,
+		active:        true,
+		lastHeartbeat: time.Now(),
+		status: WorkerStatus{
+			CurrentTaskID: 0,
+			TaskProgress:  0,
+			LastError:     "",
+			Timestamp:     time.Now(),
+		},
 	}
-
 	reply.WorkerID = wId.String()
 	return nil
 }
@@ -237,6 +264,10 @@ func (c *Coordinator) TaskComplete(args *TaskCompleteArgs, reply *TaskCompleteRe
 }
 
 func (c *Coordinator) Cleanup() {
+	c.mu.Lock()
+	c.isShuttingDown = true
+	c.mu.Unlock()
+
 	// Signal shutdown
 	select {
 	case <-c.shutdown:
@@ -257,6 +288,103 @@ func (c *Coordinator) Cleanup() {
 	if err := os.RemoveAll(c.interDir); err != nil {
 		log.Printf("Error cleaning up intermediate directory: %v", err)
 	}
+}
+
+func (c *Coordinator) recordHeartbeat(workerID string, status WorkerStatus) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	worker, exists := c.workers[workerID]
+	if !exists {
+		return
+	}
+
+	worker.lastHeartbeat = time.Now()
+	worker.status = status
+}
+
+func (c *Coordinator) Heartbeat(args *HeartbeatArgs, reply *HeartbeatReply) error {
+	log.Printf("Received heartbeat from worker %s", args.WorkerID)
+
+	if args.WorkerID == "" {
+		return fmt.Errorf("invalid worker ID")
+	}
+
+	c.mu.Lock()
+	worker, exists := c.workers[args.WorkerID]
+	if !exists {
+		c.mu.Unlock()
+		log.Printf("Heartbeat from unknown worker %s", args.WorkerID)
+		return fmt.Errorf("unknown worker")
+	}
+
+	worker.lastHeartbeat = time.Now()
+	worker.status = args.Status
+	worker.active = true
+	c.mu.Unlock()
+
+	log.Printf("Updated heartbeat for worker %s", args.WorkerID)
+
+	reply.ShouldContinue = !c.isShuttingDown
+	return nil
+}
+
+func (c *Coordinator) IsComplete() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.taskTracker.hasStartedReduce {
+		return false
+	}
+
+	return c.taskTracker.IsReducePhaseDone()
+}
+
+func (c *Coordinator) checkWorkerHealth() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := time.Now()
+	log.Printf("Checking worker health. Current workers count: %d", len(c.workers))
+
+	for id, worker := range c.workers {
+		if !worker.active {
+			continue
+		}
+
+		timeSinceHeartbeat := now.Sub(worker.lastHeartbeat)
+		log.Printf("Worker %s: Time since last heartbeat: %v", id, timeSinceHeartbeat)
+
+		if timeSinceHeartbeat > c.maxHeartbeatDelay {
+			log.Printf("Worker %s missed heartbeat (delay: %v), marking as inactive",
+				id, timeSinceHeartbeat)
+			worker.active = false
+
+			if worker.status.CurrentTaskID != 0 {
+				if err := c.taskTracker.ReassignFailedTask(worker.status.CurrentTaskID, id); err != nil {
+					log.Printf("Failed to reassign task from worker %s: %v", id, err)
+				}
+			}
+		}
+	}
+}
+
+func (c *Coordinator) startHealthCheck() {
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		ticker := time.NewTicker(c.healthCheckInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				c.checkWorkerHealth()
+			case <-c.shutdown:
+				return
+			}
+		}
+	}()
 }
 
 // Add method to check if coordinator has any active workers
@@ -288,15 +416,4 @@ func (c *Coordinator) isJobComplete() bool {
 	}
 
 	return isDone
-}
-
-func (c *Coordinator) IsComplete() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if !c.taskTracker.hasStartedReduce {
-		return false
-	}
-
-	return c.taskTracker.IsReducePhaseDone()
 }
