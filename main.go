@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -18,42 +19,40 @@ import (
 
 func main() {
 	var (
-		workerMode      = flag.Bool("worker", false, "Run as worker")
-		coordinatorAddr = flag.String("coordinator", "", "Coordinator address")
+		coordinatorMode = flag.Bool("coordinator", false, "Run as coordinator")
+		coordinatorAddr = flag.String("addr", "", "Coordinator address")
 		nReduce         = flag.Int("reduce", 5, "Number of reduce tasks")
 		inputFiles      = flag.String("input", "", "Comma-separated list of input files")
 		intermediateDir = flag.String("intermediate-dir", "", "Directory for intermediate files")
+		nWorkers        = flag.Int("workers", runtime.NumCPU(), "Number of workers to spawn (defaults to number of CPU cores)")
 	)
 	flag.Parse()
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 
-	// Create error channel
 	errChan := make(chan error, 1)
-
-	// Create context with cancel
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Handle signals in a separate goroutine
+	// Handle signals
 	go func() {
 		sig := <-sigChan
 		log.Printf("Received signal: %v", sig)
 		cancel()
-		// Force exit after 5 seconds if graceful shutdown fails
 		time.AfterFunc(5*time.Second, func() {
 			log.Println("Force exiting due to timeout")
 			os.Exit(1)
 		})
 	}()
 
-	if *workerMode {
-		runWorker(ctx, cancel, sigChan, errChan, *coordinatorAddr)
-	} else {
+	if *coordinatorMode {
 		runCoordinator(ctx, cancel, sigChan, errChan, *nReduce, *inputFiles, *intermediateDir, *coordinatorAddr)
+	} else {
+		// Spawn multiple workers
+		runWorkers(ctx, cancel, sigChan, errChan, *coordinatorAddr, *nWorkers)
 	}
 
-	// Wait for error or shutdown
+	// Wait for completion or error
 	select {
 	case err := <-errChan:
 		if err != nil {
@@ -69,47 +68,50 @@ func main() {
 	}
 }
 
-func runWorker(ctx context.Context, cancel context.CancelFunc, sigChan chan os.Signal, errChan chan error, coordinatorAddr string) {
-	log.Printf("Starting worker process...")
-
-	worker := distributed.NewWorker(
-		&map_reduce.WordCountMapper{},
-		&map_reduce.WordCountReducer{},
-	)
+func runWorkers(ctx context.Context, cancel context.CancelFunc, sigChan chan os.Signal,
+	errChan chan error, coordinatorAddr string, nWorkers int,
+) {
+	log.Printf("Starting %d worker processes...", nWorkers)
 
 	var wg sync.WaitGroup
-	wg.Add(1)
+	workerErrors := make(chan error, nWorkers)
 
-	// Handle shutdown signal
-	go func() {
-		defer wg.Done()
-		select {
-		case sig := <-sigChan:
-			log.Printf("Received signal %v, shutting down...", sig)
-			cancel()
-		case <-ctx.Done():
-			log.Printf("Context done, worker shutting down...")
-		}
-	}()
+	// Start multiple workers
+	for i := 0; i < nWorkers; i++ {
+		wg.Add(1)
+		go func(workerNum int) {
+			defer wg.Done()
 
-	// Start worker with error handling
+			worker := distributed.NewWorker(
+				&map_reduce.WordCountMapper{},
+				&map_reduce.WordCountReducer{},
+			)
+
+			// Add small delay between worker starts to prevent registration conflicts
+			time.Sleep(time.Duration(workerNum*100) * time.Millisecond)
+
+			err := worker.Register(coordinatorAddr, ctx)
+			if err != nil && err != distributed.ErrCleanShutdown &&
+				!strings.Contains(err.Error(), "RPC timeout") {
+				workerErrors <- fmt.Errorf("worker %d error: %v", workerNum, err)
+				cancel() // Cancel other workers if one fails
+			}
+		}(i)
+	}
+
+	// Handle worker errors
 	go func() {
-		err := worker.Register(coordinatorAddr, ctx)
-		if err == nil ||
-			err == distributed.ErrCleanShutdown ||
-			strings.Contains(err.Error(), "RPC timeout") {
-			log.Printf("Worker completed successfully")
-			errChan <- nil
-		} else {
+		for err := range workerErrors {
 			log.Printf("Worker error: %v", err)
 			errChan <- err
 		}
-		cancel()
 	}()
 
-	<-ctx.Done()
+	// Wait for all workers to complete
 	wg.Wait()
-	log.Printf("Worker shutdown complete")
+	close(workerErrors)
+
+	log.Printf("All workers shutdown complete")
 }
 
 func runCoordinator(ctx context.Context, cancel context.CancelFunc, sigChan chan os.Signal,

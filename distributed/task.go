@@ -161,7 +161,6 @@ func (t *TaskTracker) IsReducePhaseDone() bool {
 	defer t.mu.RUnlock()
 
 	for _, task := range t.tasks {
-		log.Printf("Task %d is not complete: %s", task.ID, task.State)
 		if task.Type == ReduceTask && task.State != TaskCompleted {
 			return false
 		}

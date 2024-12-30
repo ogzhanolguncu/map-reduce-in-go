@@ -184,29 +184,45 @@ func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 	// First check if all reduce tasks are complete
 	if c.taskTracker.hasStartedReduce && c.taskTracker.IsReducePhaseDone() {
 		reply.JobComplete = true
+		log.Printf("All reduce tasks completed for worker %s", args.WorkerID)
 		return nil
 	}
 
-	// Then check map phase and transition if needed
+	// Check and transition to reduce phase if map phase is done
 	if c.taskTracker.IsMapPhaseDone() && !c.taskTracker.hasStartedReduce {
 		if err := c.taskTracker.TransitionToReducePhase(); err != nil {
+			log.Printf("Error transitioning to reduce phase: %v", err)
 			return err
 		}
 	}
 
+	// Attempt to assign a task
 	task, err := c.taskTracker.AssignTask(args.WorkerID)
 	if err != nil {
+		log.Printf("Task assignment error for worker %s: %v", args.WorkerID, err)
 		return err
 	}
+
+	// If no task is available right now, but not job complete
 	if task == nil {
-		return fmt.Errorf("no tasks available")
+		// Check if we're just waiting for tasks to complete
+		if c.taskTracker.hasStartedReduce {
+			reply.JobComplete = c.taskTracker.IsReducePhaseDone()
+		}
+		log.Printf("No tasks available for worker %s at the moment", args.WorkerID)
+		return nil
 	}
+
+	// Populate task details
 	reply.TaskID = task.ID
 	reply.Type = task.Type
 	reply.Input = task.Input
 	reply.NReduce = c.taskTracker.nReduce
 	reply.MapID = len(c.inputFiles)
 	reply.InterDir = c.interDir
+
+	log.Printf("Assigned task %d of type %v to worker %s",
+		task.ID, task.Type, args.WorkerID)
 
 	return nil
 }
@@ -320,8 +336,16 @@ func (c *Coordinator) IsComplete() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	log.Printf("Checking job completion. Reduce started: %v", c.taskTracker.hasStartedReduce)
+
 	if !c.taskTracker.hasStartedReduce {
+		log.Println("Reduce phase not started yet")
 		return false
+	}
+
+	// Detailed logging of task states
+	for id, task := range c.taskTracker.tasks {
+		log.Printf("Task %d: Type=%s, State=%s", id, task.Type, task.State)
 	}
 
 	return c.taskTracker.IsReducePhaseDone()
@@ -395,11 +419,10 @@ func (c *Coordinator) isJobComplete() bool {
 		return false
 	}
 
-	// Add verification of all tasks
+	// Explicitly check all reduce tasks
 	allTasksCompleted := true
 	for _, task := range c.taskTracker.tasks {
-		if task.State != TaskCompleted {
-			log.Printf("Task %d still in state: %s", task.ID, task.State)
+		if task.Type == ReduceTask && task.State != TaskCompleted {
 			allTasksCompleted = false
 			break
 		}
@@ -408,8 +431,10 @@ func (c *Coordinator) isJobComplete() bool {
 	if allTasksCompleted && !c.done {
 		c.done = true
 		log.Println("All tasks completed, initiating shutdown...")
-		// Ensure clean shutdown signal is sent to workers
-		c.initiateShutdown()
+
+		go func() {
+			c.initiateShutdown()
+		}()
 	}
 
 	return allTasksCompleted

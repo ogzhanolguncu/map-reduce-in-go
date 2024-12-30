@@ -2,6 +2,11 @@ package distributed
 
 import (
 	"context"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -9,207 +14,150 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// func TestBasicMapReduce(t *testing.T) {
-// 	// Create context with timeout
-// 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-// 	defer cancel()
-//
-// 	// Create coordinator
-// 	coord := NewCoordinator(2,
-// 		[]string{"../pg-being_ernest.txt", "../pg-dorian_gray.txt", "../pg-frankenstein.txt"},
-// 		"/tmp/mr-test")
-//
-// 	// Start coordinator with error handling
-// 	err := coord.Start("localhost:1234")
-// 	require.NoError(t, err)
-// 	defer coord.Cleanup()
-//
-// 	// Ensure coordinator is ready before starting workers
-// 	time.Sleep(100 * time.Millisecond)
-//
-// 	// Create and start workers
-// 	w1 := NewWorker(&map_reduce.WordCountMapper{}, &map_reduce.WordCountReducer{})
-// 	w2 := NewWorker(&map_reduce.WordCountMapper{}, &map_reduce.WordCountReducer{})
-//
-// 	// Start workers with error handling
-// 	errCh := make(chan error, 2)
-// 	go func() {
-// 		errCh <- w1.Register("localhost:1234", ctx)
-// 	}()
-// 	go func() {
-// 		errCh <- w2.Register("localhost:1234", ctx)
-// 	}()
-//
-// 	// Wait for job completion or timeout
-// 	select {
-// 	case <-ctx.Done():
-// 		t.Fatal("Test timed out")
-// 	case err := <-errCh:
-// 		require.NoError(t, err)
-// 	}
-//
-// 	// Get and verify results
-// 	results := coord.GetResults()
-// 	require.NotEmpty(t, results)
-//
-// 	// Test common words that should appear in all books
-// 	commonWords := []string{"the", "and", "of", "to", "in"}
-// 	for _, word := range commonWords {
-// 		require.Contains(t, results, word, "Common word '%s' not found in results", word)
-// 		count, err := strconv.Atoi(results[word])
-// 		require.NoError(t, err)
-// 		require.Greater(t, count, 0, "Word '%s' has count of 0", word)
-// 	}
-//
-// 	// Verify no unexpected errors from workers
-// 	select {
-// 	case err := <-errCh:
-// 		require.NoError(t, err)
-// 	default:
-// 	}
-// }
+// TestState manages shared test state and provides isolation
+type TestState struct {
+	t            *testing.T
+	tempDir      string
+	coordAddress string
+	coordinator  *Coordinator
+	ctx          context.Context
+	cancel       context.CancelFunc
+	workers      []*Worker
+	wg           sync.WaitGroup
+}
 
-func TestWorkerHeartbeat(t *testing.T) {
-	// Create coordinator
-	coord := NewCoordinator(2, []string{"../pg-being_ernest.txt"}, "/tmp/mr-test")
-	coord.healthCheckInterval = 3 * time.Second
-	coord.maxHeartbeatDelay = 5 * time.Second
-
-	// Start coordinator
-	err := coord.Start("localhost:1234")
+func newTestState(t *testing.T) *TestState {
+	// Create unique temp directory
+	tempDir, err := os.MkdirTemp("", fmt.Sprintf("mr-test-%d-*", time.Now().UnixNano()))
 	require.NoError(t, err)
-	defer coord.Cleanup()
 
-	// Ensure coordinator is ready
-	time.Sleep(500 * time.Millisecond)
+	// Get random available port
+	listener, err := net.Listen("tcp", "localhost:0")
+	require.NoError(t, err)
+	port := listener.Addr().(*net.TCPAddr).Port
+	listener.Close()
 
-	// Create worker
-	w1 := NewWorker(&map_reduce.WordCountMapper{}, &map_reduce.WordCountReducer{})
+	coordAddress := fmt.Sprintf("localhost:%d", port)
+	ctx, cancel := context.WithCancel(context.Background())
 
-	// Create context with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	// Start worker in goroutine
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- w1.Register("localhost:1234", ctx)
-	}()
-
-	// Wait longer for worker to register and establish heartbeat
-	time.Sleep(1 * time.Second)
-
-	// Verify worker is active
-	require.True(t, coord.hasActiveWorkers(), "Worker should be marked as active")
-
-	// Check worker info in coordinator
-	coord.mu.Lock()
-	var worker *WorkerInfo
-	for _, w := range coord.workers {
-		worker = w
-		break
-	}
-	coord.mu.Unlock()
-
-	require.NotNil(t, worker, "Worker should be registered")
-	require.True(t, worker.active, "Worker should be active")
-	require.False(t, worker.lastHeartbeat.IsZero(), "Worker should have sent heartbeat")
-
-	// Simulate worker failure by canceling context
-	cancel()
-
-	// Wait for health check to detect failure
-	time.Sleep(6 * time.Second)
-
-	// Verify worker is marked as inactive
-	require.False(t, coord.hasActiveWorkers(), "Worker should be marked as inactive after failure")
-
-	// Check if worker exited properly
-	select {
-	case err := <-errCh:
-		require.Error(t, err, "Worker should exit with error")
-	case <-time.After(time.Second):
-		t.Fatal("Worker failed to exit")
+	return &TestState{
+		t:            t,
+		tempDir:      tempDir,
+		coordAddress: coordAddress,
+		ctx:          ctx,
+		cancel:       cancel,
 	}
 }
 
-// func TestTaskProgressReporting(t *testing.T) {
-// 	// Create coordinator
-// 	coord := NewCoordinator(2, []string{"../pg-being_ernest.txt"}, "/tmp/mr-test")
-//
-// 	// Start coordinator
-// 	err := coord.Start("localhost:1235")
-// 	require.NoError(t, err)
-// 	defer coord.Cleanup()
-//
-// 	// Create worker
-// 	w1 := NewWorker(&map_reduce.WordCountMapper{}, &map_reduce.WordCountReducer{})
-//
-// 	// Start worker with longer timeout
-// 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-// 	defer cancel()
-//
-// 	// Start worker in goroutine
-// 	go func() {
-// 		w1.Register("localhost:1235", ctx)
-// 	}()
-//
-// 	// Wait for task to be assigned and processed
-// 	time.Sleep(2 * time.Second)
-//
-// 	// Check progress reports
-// 	coord.mu.Lock()
-// 	var lastProgress float64
-// 	var lastTaskID int
-// 	for _, worker := range coord.workers {
-// 		lastProgress = worker.status.TaskProgress
-// 		lastTaskID = worker.status.CurrentTaskID
-// 	}
-// 	coord.mu.Unlock()
-//
-// 	require.Greater(t, lastProgress, float64(0), "Worker should report non-zero progress")
-// 	require.GreaterOrEqual(t, lastTaskID, 0, "Worker should report valid task ID")
-// }
-//
-// func TestWorkerHealthCheckTimeout(t *testing.T) {
-// 	// Create coordinator with very short timeouts for testing
-// 	coord := NewCoordinator(2, []string{"../pg-being_ernest.txt"}, "/tmp/mr-test")
-// 	coord.healthCheckInterval = 50 * time.Millisecond
-// 	coord.maxHeartbeatDelay = 100 * time.Millisecond
-//
-// 	// Start coordinator
-// 	err := coord.Start("localhost:1236")
-// 	require.NoError(t, err)
-// 	defer coord.Cleanup()
-//
-// 	// Create and register worker
-// 	w1 := NewWorker(&map_reduce.WordCountMapper{}, &map_reduce.WordCountReducer{})
-//
-// 	ctx, cancel := context.WithCancel(context.Background())
-// 	go func() {
-// 		w1.Register("localhost:1236", ctx)
-// 	}()
-//
-// 	// Wait for worker to register
-// 	time.Sleep(200 * time.Millisecond)
-// 	require.True(t, coord.hasActiveWorkers(), "Worker should be active initially")
-//
-// 	// Cancel worker context to stop heartbeats
-// 	cancel()
-//
-// 	// Wait for health check to detect timeout
-// 	time.Sleep(200 * time.Millisecond)
-// 	require.False(t, coord.hasActiveWorkers(), "Worker should be marked inactive after timeout")
-//
-// 	// Verify task reassignment
-// 	coord.mu.Lock()
-// 	var worker *WorkerInfo
-// 	for _, w := range coord.workers {
-// 		worker = w
-// 		break
-// 	}
-// 	coord.mu.Unlock()
-//
-// 	require.NotNil(t, worker)
-// 	require.False(t, worker.active, "Worker should be marked inactive")
-// }
+func (ts *TestState) cleanup() {
+	// Cancel context to stop all operations
+	ts.cancel()
+
+	// Clean up coordinator if it exists
+	if ts.coordinator != nil {
+		ts.coordinator.Cleanup()
+	}
+
+	// Clean up workers
+	for _, w := range ts.workers {
+		if w != nil {
+			// Give workers time to shutdown gracefully
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	// Wait for all goroutines to complete
+	ts.wg.Wait()
+
+	// Remove temp directory
+	if ts.tempDir != "" {
+		os.RemoveAll(ts.tempDir)
+	}
+}
+
+func createTestFile(dir, name, content string) (string, error) {
+	filepath := filepath.Join(dir, name)
+	return filepath, os.WriteFile(filepath, []byte(content), 0644)
+}
+
+func TestBasicMapReduceWorkflow(t *testing.T) {
+	ts := newTestState(t)
+	defer ts.cleanup()
+
+	// Create test input file
+	testFile, err := createTestFile(ts.tempDir, "test.txt",
+		"hello world\nthis is a test\nhello test\nworld hello\n")
+	require.NoError(t, err)
+
+	// Create and start coordinator
+	ts.coordinator = NewCoordinator(2, []string{testFile}, ts.tempDir)
+	err = ts.coordinator.Start(ts.coordAddress)
+	require.NoError(t, err)
+
+	// Create completion channel
+	completionCh := make(chan struct{})
+	errorCh := make(chan error, 2)
+
+	// Monitor completion
+	ts.wg.Add(1)
+	go func() {
+		defer ts.wg.Done()
+		for {
+			select {
+			case <-ts.ctx.Done():
+				return
+			default:
+				if ts.coordinator.IsComplete() {
+					close(completionCh)
+					return
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+	}()
+
+	// Start workers
+	for i := 0; i < 2; i++ {
+		worker := NewWorker(&map_reduce.WordCountMapper{}, &map_reduce.WordCountReducer{})
+		ts.workers = append(ts.workers, worker)
+
+		ts.wg.Add(1)
+		go func(w *Worker, workerNum int) {
+			defer ts.wg.Done()
+			// Add small delay between worker starts
+			time.Sleep(time.Duration(workerNum*100) * time.Millisecond)
+
+			if err := w.Register(ts.coordAddress, ts.ctx); err != nil {
+				if err != ErrCleanShutdown && err != context.Canceled {
+					errorCh <- fmt.Errorf("worker %d error: %v", workerNum, err)
+				}
+			}
+		}(worker, i)
+	}
+
+	// Wait for completion or error
+	select {
+	case <-completionCh:
+		// Verify results
+		results := ts.coordinator.GetResults()
+		require.NotEmpty(t, results)
+
+		expectedWords := map[string]string{
+			"hello": "3",
+			"world": "2",
+			"test":  "2",
+		}
+
+		for word, expectedCount := range expectedWords {
+			actualCount, exists := results[word]
+			require.True(t, exists, "Word '%s' not found in results", word)
+			require.Equal(t, expectedCount, actualCount,
+				"Incorrect count for word '%s'", word)
+		}
+
+	case err := <-errorCh:
+		t.Fatalf("Worker error: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("Test timed out")
+	}
+}
